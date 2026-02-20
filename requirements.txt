@@ -9,3 +9,4 @@ accelerate
 safetensors
 torch
 pillow
+datasets
