@@ -1,0 +1,10 @@
+# TP4/configs/gcn.yaml
+seed: 42
+device: "cuda"
+epochs: 50
+lr: 0.01
+weight_decay: 0.01
+
+gcn:
+  hidden_dim: 64
+  dropout: 0.5

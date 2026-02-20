@@ -1,89 +1,91 @@
-import os
-import json
-from dataclasses import dataclass
-from typing import List, Tuple
-
+# TP4/src/train.py
+from __future__ import annotations
+import argparse
+import yaml
 import torch
-import torchaudio
+import torch.nn as nn
+import time
 
-# silero-vad (modèle VAD léger prêt à l’emploi)
-# Référence: https://github.com/snakers4/silero-vad
-# Installation (si besoin): pip install silero-vad
-from silero_vad import get_speech_timestamps
+from data import load_cora
+from models import MLP
+from utils import set_seed, Timer, compute_metrics
 
-@dataclass
-class Segment:
-    start_s: float
-    end_s: float
 
-def load_wav_mono_16k(path: str) -> Tuple[torch.Tensor, int]:
-    wav, sr = torchaudio.load(path)          # [C, T]
-    wav = wav.mean(dim=0, keepdim=True)      # mono [1, T]
-    if sr != 16000:
-        wav = torchaudio.functional.resample(wav, sr, 16000)
-        sr = 16000
-    return wav.squeeze(0), sr                # [T], sr
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", type=str, required=True)
+    return p.parse_args()
 
-def main():
-    in_path = "TP3/data/call_01.wav"
-    out_path = "TP3/outputs/vad_segments_call_01.json"
-    os.makedirs("TP3/outputs", exist_ok=True)
 
-    wav, sr = load_wav_mono_16k(in_path)     # wav: [T]
-    duration_s = wav.numel() / sr
+def main() -> None:
+    args = parse_args()
+    cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
 
-    model, utils = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        trust_repo=True
+    set_seed(int(cfg["seed"]))
+
+    device_str = cfg.get("device", "cuda")
+    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+
+    data = load_cora()
+    x = data.x.to(device)
+    y = data.y.to(device)
+
+    train_mask = data.train_mask.to(device)
+    val_mask = data.val_mask.to(device)
+    test_mask = data.test_mask.to(device)
+
+    model = MLP(
+        in_dim=data.num_features,
+        hidden_dim=int(cfg["mlp"]["hidden_dim"]),
+        out_dim=data.num_classes,
+        dropout=float(cfg["mlp"]["dropout"]),
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(cfg["lr"]),
+        weight_decay=float(cfg["weight_decay"]),
     )
-    model.to("cpu").eval()
+    criterion = nn.CrossEntropyLoss()
 
-    # TODO: VAD -> timestamps (en indices samples)
-    # Astuce: get_speech_timestamps attend un tenseur 1D float32 en 16 kHz
-    speech_ts = get_speech_timestamps(
-        wav.to(torch.float32),
-        model,
-        sampling_rate=sr
-    )
+    epochs = int(cfg["epochs"])
+    print("device:", device)
+    print("epochs:", epochs)
 
-    # Convertir en segments en secondes
-    segments: List[Segment] = []
-    for seg in speech_ts:
-        start_s = seg["start"] / sr
-        end_s = seg["end"] / sr
-        segments.append(Segment(start_s=start_s, end_s=end_s))
+    total_train_s = 0.0
+    train_start = time.time()
+    for epoch in range(1, epochs + 1):
+        model.train()
+        with Timer() as t:
+            logits = model(x)
+            loss = criterion(logits[train_mask], y[train_mask])
 
-    # Filtrage simple : supprimer segments trop courts
-    min_dur_s = 0.30
-    segments = [s for s in segments if (s.end_s - s.start_s) >= min_dur_s]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        total_train_s += t.elapsed_s
 
-    # Stats
-    total_speech_s = sum((s.end_s - s.start_s) for s in segments)
-    speech_ratio = total_speech_s / max(duration_s, 1e-9)
+        model.eval()
+        with torch.no_grad():
+            logits = model(x)
 
-    print("duration_s:", round(duration_s, 2))
-    print("num_segments:", len(segments))
-    print("total_speech_s:", round(total_speech_s, 2))
-    print("speech_ratio:", round(speech_ratio, 3))
+            m_train = compute_metrics(logits[train_mask], y[train_mask], data.num_classes)
+            m_val = compute_metrics(logits[val_mask], y[val_mask], data.num_classes)
+            m_test = compute_metrics(logits[test_mask], y[test_mask], data.num_classes)
 
-    # Sauvegarde JSON
-    payload = {
-        "audio_path": in_path,
-        "sample_rate": sr,
-        "duration_s": duration_s,
-        "min_segment_s": min_dur_s,
-        "segments": [{"start_s": s.start_s, "end_s": s.end_s} for s in segments],
-        "stats": {
-            "num_segments": len(segments),
-            "total_speech_s": total_speech_s,
-            "speech_ratio": speech_ratio
-        }
-    }
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        if epoch == 1 or epoch % 20 == 0 or epoch == epochs:
+            print(
+                f"epoch={epoch:03d} "
+                f"loss={loss.item():.4f} "
+                f"train_acc={m_train['acc']:.4f} val_acc={m_val['acc']:.4f} test_acc={m_test['acc']:.4f} "
+                f"train_f1={m_train['macro_f1']:.4f} val_f1={m_val['macro_f1']:.4f} test_f1={m_test['macro_f1']:.4f} "
+                f"epoch_time_s={t.elapsed_s:.4f}"
+            )
 
-    print("saved:", out_path)
+    print(f"total_train_time_s={total_train_s:.4f}")
+    train_loop_time = time.time() - train_start
+    print(f"train_loop_time={train_loop_time:.4f}")
+
 
 if __name__ == "__main__":
     main()
